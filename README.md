@@ -119,19 +119,23 @@ uv run python 03_mcp_client.py
 
 ### 04. 멀티턴 메모리 — `04_memory.py`
 
-`MemorySaver`로 대화 기록을 `thread_id`별로 저장합니다.
-같은 `thread_id`로 호출하면 이전 대화를 이어갑니다.
+`MemorySaver` 대신 Python `dict`로 `thread_id`별 메시지 목록을 직접 관리합니다.
+그래프는 체크포인터 없이 컴파일하고, 호출 전에 이전 메시지를 직접 주입합니다.
 
 **핵심 개념**
-- `MemorySaver`: 인메모리 체크포인터. 그래프 State를 스냅샷으로 보존
+- `store: dict[str, list[BaseMessage]]`: thread_id → 메시지 목록 저장소
 - `thread_id`: 대화 세션 식별자. 다른 ID면 독립된 대화
-- `config = {"configurable": {"thread_id": "..."}}`: 모든 `invoke` 호출에 전달
+- `invoke(thread_id, message)`: 히스토리를 꺼내 주입하고, 결과를 다시 저장
+
+**MemorySaver 대비 장점**
+- `store` dict를 직접 접근해 기록 조회(`get_history`) / 삭제(`clear_history`) 가능
+- JSON 직렬화 등 외부 저장소 연동 시 확장이 쉬움
 
 ```bash
 uv run python 04_memory.py
 ```
 
-`demo-1` thread에서 이름을 기억하고, `demo-2` thread에서는 모르는 것을 확인합니다.
+`thread-A`에서 이름을 기억하고, `thread-B`에서는 모르는 것을 확인합니다.
 
 ---
 
@@ -232,10 +236,12 @@ START → router_node → (tool_agent_node | direct_chat_node) → END
 
 | 기능 | 구현 |
 |------|------|
-| 메모리 | `MemorySaver` + `thread_id` |
+| 메모리 | Python `dict` + `thread_id` (04와 동일 방식) |
 | 도구 자동 선택 | `router_node`가 LLM으로 판단 |
 | 도구 실행 | `tool_agent_node` (ReAct) |
 | 토큰 스트리밍 | `stream_mode="messages"` + `langgraph_node` 필터 |
+
+스트리밍 중 `AIMessageChunk`를 누적(`chunk + chunk`)해 저장소에 반영하므로 LLM을 한 번만 호출합니다.
 
 **등록된 도구**
 - `get_time`: 현재 시각
@@ -250,11 +256,17 @@ uv run python 09_chatbot.py
 
 ---
 
+```bash
+uv run python 10_skills.py
+```
+
+---
+
 ## 학습 순서
 
 ```
-01 → 02 → 03 → 04 → 05 → 06 → 07 → 08 → 09
-기초   도구  MCP  메모리 분기  스트림 HITL  멀티   종합
+01 → 02 → 03 → 04 → 05 → 06 → 07 → 08 → 09 → 10
+기초   도구  MCP  메모리 분기  스트림 HITL  멀티   종합  스킬
 ```
 
 ## 문제 해결

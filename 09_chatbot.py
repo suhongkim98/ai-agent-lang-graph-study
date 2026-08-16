@@ -5,15 +5,16 @@
 그래프 구조:
   START → router → tool_agent  → END  (도구 필요 시)
                  → direct_chat → END  (일반 대화)
+
+메모리: MemorySaver 대신 Python dict로 thread_id별 메시지를 직접 관리합니다.
 """
 
 from datetime import datetime
 from typing import Annotated, Literal
 
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import create_react_agent
@@ -109,9 +110,11 @@ def route(state: State) -> Literal["tool_agent_node", "direct_chat_node"]:
     return "tool_agent_node" if state["use_tools"] else "direct_chat_node"
 
 
-# ── 그래프 ─────────────────────────────────────────
+# ── 대화 저장소 ────────────────────────────────────
+# { thread_id: [HumanMessage, AIMessage, ...] }
+store: dict[str, list[BaseMessage]] = {}
 
-checkpointer = MemorySaver()
+# ── 그래프 ─────────────────────────────────────────
 
 graph = (
     StateGraph(State)
@@ -122,14 +125,15 @@ graph = (
     .add_conditional_edges("router_node", route)
     .add_edge("tool_agent_node", END)
     .add_edge("direct_chat_node", END)
-    .compile(checkpointer=checkpointer)
+    .compile()
 )
+
+ANSWER_NODES = {"tool_agent_node", "direct_chat_node"}
 
 
 # ── 실행 ───────────────────────────────────────────
 
 def chat(thread_id: str = "user-1"):
-    config = {"configurable": {"thread_id": thread_id}}
     print("종합 챗봇 시작 (종료: quit)\n")
 
     while True:
@@ -139,18 +143,24 @@ def chat(thread_id: str = "user-1"):
         if not user_input:
             continue
 
-        # 스트리밍으로 토큰 단위 출력
+        history = store.setdefault(thread_id, [])
+
+        # 스트리밍 — 토큰 출력과 동시에 청크 누적
         print("AI: ", end="", flush=True)
-        ANSWER_NODES = {"tool_agent_node", "direct_chat_node"}
+        ai_chunk = None
 
         for token, metadata in graph.stream(
-            {"messages": [{"role": "user", "content": user_input}], "use_tools": False},
-            config=config,
+            {"messages": history + [{"role": "user", "content": user_input}], "use_tools": False},
             stream_mode="messages",
         ):
-            # router_node 토큰 제외 — 답변 노드 토큰만 출력
             if metadata.get("langgraph_node") in ANSWER_NODES and token.content:
                 print(token.content, end="", flush=True)
+                # AIMessageChunk끼리 + 연산으로 하나의 메시지로 병합
+                ai_chunk = token if ai_chunk is None else ai_chunk + token
+
+        # 스트리밍 1회로 저장소 갱신 (LLM 이중 호출 없음)
+        if ai_chunk is not None:
+            store[thread_id] = history + [HumanMessage(content=user_input), ai_chunk]
 
         print("\n")
 
