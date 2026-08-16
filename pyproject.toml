@@ -1,0 +1,21 @@
+[project]
+name = "langgraph-study"
+version = "0.1.0"
+description = "Add your description here"
+authors = [
+    { name = "suhongkim98", email = "kshz9815@naver.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "langchain-mcp-adapters>=0.3.2",
+    "langchain-ollama>=1.1.0",
+    "langgraph>=1.2.11",
+    "mcp>=1.29.0",
+]
+
+[project.scripts]
+langgraph-study = "langgraph_study:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
