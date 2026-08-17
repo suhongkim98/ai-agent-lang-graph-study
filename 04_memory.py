@@ -99,7 +99,7 @@ def chat(thread_id: str = "default"):
     """대화 루프 (종료: quit)"""
     print(f"대화 시작 (thread: {thread_id}) — 종료: quit\n")
     while True:
-        user_input = input("You: ").strip()
+        user_input = input("You: ").encode("utf-8", errors="replace").decode("utf-8").strip()
         if user_input.lower() in ("quit", "exit", "q"):
             break
         if not user_input:

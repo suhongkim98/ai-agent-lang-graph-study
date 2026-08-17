@@ -321,7 +321,7 @@ def chat(thread_id: str = "user-1"):
     print("RAG 챗봇 시작 (종료: quit)\n")
 
     while True:
-        user_input = input("You: ").strip()
+        user_input = input("You: ").encode("utf-8", errors="replace").decode("utf-8").strip()
         if user_input.lower() in ("quit", "exit", "q"):
             break
         if not user_input:

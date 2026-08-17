@@ -100,7 +100,7 @@ graph = (
 
 def run():
     config = {"configurable": {"thread_id": "email-1"}}
-    topic = input("이메일 주제를 입력하세요: ").strip()
+    topic = input("이메일 주제를 입력하세요: ").encode("utf-8", errors="replace").decode("utf-8").strip()
 
     # 1단계: draft까지 실행 → human_review_node 직전에서 멈춤
     graph.invoke(
@@ -119,7 +119,7 @@ def run():
         if not current.next:  # 더 이상 실행할 노드 없으면 종료
             break
 
-        human_input = input("\n> ").strip()
+        human_input = input("\n> ").encode("utf-8", errors="replace").decode("utf-8").strip()
         result = graph.invoke(Command(resume=human_input), config=config)
 
         # finalize까지 완료됐으면 종료

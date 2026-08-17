@@ -238,7 +238,7 @@ def chat():
     """대화 루프 (종료: quit)"""
     print("RAG + Reranker 채팅 시작 (종료: quit)\n")
     while True:
-        question = input("Q: ").strip()
+        question = input("Q: ").encode("utf-8", errors="replace").decode("utf-8").strip()
         if question.lower() in ("quit", "exit", "q"):
             break
         if not question:
