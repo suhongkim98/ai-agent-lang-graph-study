@@ -62,8 +62,10 @@ def remember_fact(fact: str) -> str:
 
 TOOLS = [get_time, calculate, remember_fact]
 
-RETRIEVE_K = 6      # 벡터 검색 후보 수
-RERANK_TOP_K = 3    # 리랭킹 후 선택 수
+RETRIEVE_K = 6              # 벡터 검색 후보 수
+RERANK_TOP_K = 3            # 리랭킹 후 선택 수
+MIN_RERANK_SCORE = 5.0      # 이 점수 미만 문서는 컨텍스트에서 제외
+_UNANSWERABLE_PREFIX = "문서에 없는 내용입니다"
 
 # ── LLM & 임베딩 ──────────────────────────────────
 # 임베딩 모델: ollama pull nomic-embed-text
@@ -230,7 +232,8 @@ def rerank_node(state: State) -> State:
         )
         scored.append({**cand, "score": _parse_score(result.content)})
 
-    top = sorted(scored, key=lambda x: x["score"], reverse=True)[:RERANK_TOP_K]
+    ranked = sorted(scored, key=lambda x: x["score"], reverse=True)
+    top = [d for d in ranked if d["score"] >= MIN_RERANK_SCORE][:RERANK_TOP_K]
     return {
         "context": [d["content"] for d in top],
         "sources": list(dict.fromkeys(d["source"] for d in top)),
@@ -238,15 +241,16 @@ def rerank_node(state: State) -> State:
 
 
 def rag_chat_node(state: State) -> State:
-    """검색된 문서를 컨텍스트로 포함해 LLM이 답변합니다."""
+    """검색된 문서를 컨텍스트로 포함해 LLM이 답변합니다.
+    문서로 답할 수 없을 때는 _UNANSWERABLE_PREFIX로 시작하도록 지시합니다."""
     context_text = "\n\n".join(state["context"])
     last_question = state["messages"][-1].content
     rag_prompt = (
-        f"다음 문서를 참고해 질문에 답하세요. 문서에 없는 내용은 모른다고 하세요.\n\n"
+        f"다음 문서를 참고해 질문에 답하세요.\n"
+        f'문서로 답할 수 없으면 반드시 "{_UNANSWERABLE_PREFIX}"로 시작하세요.\n\n'
         f"[참고 문서]\n{context_text}\n\n"
         f"[질문]\n{last_question}"
     )
-    # 이전 대화 맥락은 유지하되, 마지막 질문은 RAG 프롬프트로 교체
     history = list(state["messages"][:-1])
     response = llm.invoke([SYSTEM] + history + [{"role": "user", "content": rag_prompt}])
     return {"messages": [response]}
@@ -330,7 +334,9 @@ def chat(thread_id: str = "user-1"):
                     print(token.content, end="", flush=True)
                     ai_chunk = token if ai_chunk is None else ai_chunk + token
 
-        if sources_captured:
+        # 스트리밍된 답변이 _UNANSWERABLE_PREFIX로 시작하면 출처 표시 생략
+        answer_text = ai_chunk.content.strip() if ai_chunk else ""
+        if sources_captured and not answer_text.startswith(_UNANSWERABLE_PREFIX):
             print(f"\n출처: {' · '.join(sources_captured)}", end="", flush=True)
 
         if ai_chunk is not None:

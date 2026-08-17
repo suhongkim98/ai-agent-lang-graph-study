@@ -242,6 +242,7 @@ START → retrieve → generate → END
 - `OllamaEmbeddings`: 로컬 임베딩 모델(`nomic-embed-text`)로 문서 인덱싱
 - `similarity_search(query, k=3)`: 질문과 가장 유사한 문서 k개 반환
 - RAG 패턴: `retrieve` 노드(문서 검색) → `generate` 노드(컨텍스트 기반 답변)
+- 출처 표시: 문서로 답변 가능한 경우에만 출처를 표시하고, 답변 불가 시 생략
 
 ```bash
 uv run python 09_rag.py
@@ -253,22 +254,23 @@ uv run python 09_rag.py
 
 ### 10. RAG + Reranker — `10_rag_rerank.py`
 
-벡터 검색으로 후보를 넓게 뽑은 뒤, LLM이 관련성을 점수화해 상위 문서만 선별합니다.
+벡터 검색으로 후보를 넓게 뽑은 뒤, LLM이 관련성을 점수화해 임계값 이상 문서만 선별합니다.
 
 ```
 START → retrieve(k=6) → rerank → generate → END
 ```
 
 **핵심 개념**
-- `retrieve`: 임베딩 유사도로 후보 6개를 넓게 검색
-- `rerank`: LLM이 각 후보에 0~10점 부여 → 상위 3개 선별
-- `generate`: 선별된 3개 문서로 답변 생성 + 출처 표시
-- 점수 결과가 터미널에 출력되어 선별 과정이 눈에 보임
+- `retrieve`: 임베딩 유사도로 후보 `RETRIEVE_K=6`개를 넓게 검색
+- `rerank`: LLM이 각 후보에 0~10점 부여 → `MIN_RERANK_SCORE=5.0` 이상만 통과 → 상위 `RERANK_TOP_K=3`개 선별
+- `generate`: 선별된 문서로 답변 생성 — 통과 문서가 없으면 LLM이 답변 불가 신호를 보냄
+- 출처 표시: 문서로 답변 가능한 경우에만 표시
+- 점수 결과(`✓` 선택 / `✗` 임계값 미달)가 터미널에 출력되어 선별 과정이 눈에 보임
 
 | 단계 | 기준 | 특징 |
 |------|------|------|
 | retrieve | 임베딩 각도(cosine) | 단어 유사성 기반, 빠름 |
-| rerank | LLM 의미 이해 | 질문 의도 파악, 정확함 |
+| rerank | LLM 의미 이해 + 점수 임계값 | 질문 의도 파악, 저관련 문서 차단 |
 
 > 프로덕션에서는 LLM 대신 `cross-encoder/ms-marco-MiniLM-L-6-v2` 같은 전용 cross-encoder 모델을 씁니다.
 
@@ -294,9 +296,9 @@ START → router → tool_agent                       → END  (도구 필요 �
 | 메모리 | Python `dict` + `thread_id` |
 | 도구 자동 선택 | `router_node`가 LLM으로 판단 |
 | 도구 실행 | `tool_agent_node` (ReAct) |
-| RAG + Rerank | `retrieve_node(k=6)` → `rerank_node` → `rag_chat_node` |
+| RAG + Rerank | `retrieve_node(k=6)` → `rerank_node(MIN_SCORE=5.0)` → `rag_chat_node` |
 | 토큰 스트리밍 | `stream_mode=["messages", "updates"]` |
-| 출처 표시 | rerank_node 완료 시 sources 캡처 → 스트림 후 출력 |
+| 출처 표시 | 답변 가능 시만 표시 — 불가 시 출처 생략 |
 
 **등록된 도구**
 - `get_time`: 현재 시각

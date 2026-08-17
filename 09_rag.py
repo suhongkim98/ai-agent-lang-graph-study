@@ -106,18 +106,23 @@ def retrieve(state: State) -> State:
     }
 
 
+_UNANSWERABLE_PREFIX = "문서에 없는 내용입니다"
+
+
 def generate(state: State) -> State:
-    """검색된 문서를 컨텍스트로 LLM에 전달해 답변을 생성하고 출처를 붙입니다."""
+    """검색된 문서를 컨텍스트로 LLM에 전달해 답변을 생성합니다.
+    문서로 답할 수 없으면 출처를 표시하지 않습니다."""
     context = "\n\n".join(state["documents"])
     prompt = (
-        "다음 문서를 참고해 질문에 답하세요. "
-        "문서에 없는 내용은 모른다고 하세요.\n\n"
+        "다음 문서를 참고해 질문에 답하세요.\n"
+        f'문서로 답할 수 없으면 반드시 "{_UNANSWERABLE_PREFIX}"로 시작하세요.\n\n'
         f"[문서]\n{context}\n\n"
         f"[질문]\n{state['question']}"
     )
     response = llm.invoke(prompt)
-    sources_text = " · ".join(state["sources"])
-    return {"answer": f"{response.content}\n\n출처: {sources_text}"}
+    can_answer = not response.content.strip().startswith(_UNANSWERABLE_PREFIX)
+    suffix = f"\n\n출처: {' · '.join(state['sources'])}" if can_answer else ""
+    return {"answer": f"{response.content}{suffix}"}
 
 
 # ── 그래프 조립 ─────────────────────────────────────────

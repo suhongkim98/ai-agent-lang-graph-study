@@ -30,8 +30,9 @@ from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
-RETRIEVE_K = 6      # 벡터 검색 후보 수 (넓게)
-RERANK_TOP_K = 3    # 리랭킹 후 선택 수 (좁게)
+RETRIEVE_K = 6          # 벡터 검색 후보 수 (넓게)
+RERANK_TOP_K = 3        # 리랭킹 후 선택 수 (좁게)
+MIN_RERANK_SCORE = 5.0  # 이 점수 미만 문서는 컨텍스트에서 제외
 
 
 # ── State ─────────────────────────────────────────────
@@ -157,33 +158,44 @@ def rerank(state: State) -> State:
         score = _parse_score(result.content)
         scored.append({**cand, "score": score})
 
-    # 점수 내림차순 정렬 후 상위 k개 선택
+    # 점수 내림차순 정렬 → MIN_RERANK_SCORE 이상만 필터링 → 상위 k개 선택
     ranked = sorted(scored, key=lambda x: x["score"], reverse=True)
+    filtered = [d for d in ranked if d["score"] >= MIN_RERANK_SCORE]
+    top = filtered[:RERANK_TOP_K]
 
     print("[rerank] 점수 결과:")
     for item in ranked:
-        marker = "✓" if item in ranked[:RERANK_TOP_K] else " "
+        if item["score"] >= MIN_RERANK_SCORE and item in top:
+            marker = "✓"
+        elif item["score"] < MIN_RERANK_SCORE:
+            marker = "✗"  # 임계값 미달
+        else:
+            marker = " "
         print(f"  {marker} {item['score']:4.1f}점  {item['source']}")
 
-    top = ranked[:RERANK_TOP_K]
     return {
         "documents": [d["content"] for d in top],
         "sources": list(dict.fromkeys(d["source"] for d in top)),
     }
 
 
+_UNANSWERABLE_PREFIX = "문서에 없는 내용입니다"
+
+
 def generate(state: State) -> State:
-    """선별된 문서로 답변을 생성하고 출처를 붙입니다."""
+    """선별된 문서로 답변을 생성합니다.
+    문서로 답할 수 없으면 출처를 표시하지 않습니다."""
     context = "\n\n".join(state["documents"])
     prompt = (
-        "다음 문서를 참고해 질문에 답하세요. "
-        "문서에 없는 내용은 모른다고 하세요.\n\n"
+        "다음 문서를 참고해 질문에 답하세요.\n"
+        f'문서로 답할 수 없으면 반드시 "{_UNANSWERABLE_PREFIX}"로 시작하세요.\n\n'
         f"[문서]\n{context}\n\n"
         f"[질문]\n{state['question']}"
     )
     response = llm.invoke(prompt)
-    sources_text = " · ".join(state["sources"])
-    return {"answer": f"{response.content}\n\n출처: {sources_text}"}
+    can_answer = not response.content.strip().startswith(_UNANSWERABLE_PREFIX)
+    suffix = f"\n\n출처: {' · '.join(state['sources'])}" if can_answer else ""
+    return {"answer": f"{response.content}{suffix}"}
 
 
 # ── 그래프 조립 ─────────────────────────────────────────
