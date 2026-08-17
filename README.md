@@ -20,8 +20,11 @@ API 키 없이 로컬 LLM(Ollama)으로 LangGraph의 핵심 개념을 단계별�
 # macOS
 brew install ollama
 
-# 모델 다운로드 (도구 호출 지원 모델)
+# LLM 모델 (도구 호출 지원)
 ollama pull qwen3:8b
+
+# 임베딩 모델 (RAG 예제에서 사용)
+ollama pull nomic-embed-text
 ```
 
 ### 2단계 — uv 설치 및 프로젝트 패키지 설치
@@ -52,6 +55,7 @@ ollama serve
 | `langchain-ollama` | Ollama ↔ LangChain 연결 |
 | `langchain-mcp-adapters` | MCP 서버 도구를 LangChain으로 변환 |
 | `mcp` | MCP 서버 구현 |
+| `numpy` | `InMemoryVectorStore` 코사인 유사도 계산에 필요 |
 
 ---
 
@@ -224,24 +228,75 @@ uv run python 08_multi_agent.py
 
 ---
 
-### 09. 종합 챗봇 — `09_chatbot.py`
+### 09. RAG 기반 답변 — `09_rag.py`
 
-지금까지 배운 개념을 하나로 결합한 실용적인 챗봇입니다.
+문서를 벡터 스토어에 저장하고, 질문과 유사한 문서를 검색해 LLM이 정확하게 답변합니다.
+추가 패키지 없이 `langchain-core` + `langchain-ollama`만으로 동작합니다.
 
 ```
-START → router_node → (tool_agent_node | direct_chat_node) → END
+START → retrieve → generate → END
+```
+
+**핵심 개념**
+- `InMemoryVectorStore`: `langchain-core` 내장 벡터 스토어, 외부 서비스 불필요
+- `OllamaEmbeddings`: 로컬 임베딩 모델(`nomic-embed-text`)로 문서 인덱싱
+- `similarity_search(query, k=3)`: 질문과 가장 유사한 문서 k개 반환
+- RAG 패턴: `retrieve` 노드(문서 검색) → `generate` 노드(컨텍스트 기반 답변)
+
+```bash
+uv run python 09_rag.py
+```
+
+대화 루프가 실행됩니다. `quit` 입력 시 종료.
+
+---
+
+### 10. RAG + Reranker — `10_rag_rerank.py`
+
+벡터 검색으로 후보를 넓게 뽑은 뒤, LLM이 관련성을 점수화해 상위 문서만 선별합니다.
+
+```
+START → retrieve(k=6) → rerank → generate → END
+```
+
+**핵심 개념**
+- `retrieve`: 임베딩 유사도로 후보 6개를 넓게 검색
+- `rerank`: LLM이 각 후보에 0~10점 부여 → 상위 3개 선별
+- `generate`: 선별된 3개 문서로 답변 생성 + 출처 표시
+- 점수 결과가 터미널에 출력되어 선별 과정이 눈에 보임
+
+| 단계 | 기준 | 특징 |
+|------|------|------|
+| retrieve | 임베딩 각도(cosine) | 단어 유사성 기반, 빠름 |
+| rerank | LLM 의미 이해 | 질문 의도 파악, 정확함 |
+
+> 프로덕션에서는 LLM 대신 `cross-encoder/ms-marco-MiniLM-L-6-v2` 같은 전용 cross-encoder 모델을 씁니다.
+
+```bash
+uv run python 10_rag_rerank.py
+```
+
+---
+
+### 종합 챗봇 (RAG + Reranker) — `chatbot.py`
+
+지금까지 배운 모든 개념을 결합한 챗봇입니다. 일반 질문은 Reranker를 거쳐 가장 관련성 높은 문서로 답변합니다.
+
+```
+START → router → tool_agent                       → END  (도구 필요 시)
+               → retrieve → rerank → rag_chat    → END  (일반 질문 → RAG + Rerank)
 ```
 
 **결합된 기능**
 
 | 기능 | 구현 |
 |------|------|
-| 메모리 | Python `dict` + `thread_id` (04와 동일 방식) |
+| 메모리 | Python `dict` + `thread_id` |
 | 도구 자동 선택 | `router_node`가 LLM으로 판단 |
 | 도구 실행 | `tool_agent_node` (ReAct) |
-| 토큰 스트리밍 | `stream_mode="messages"` + `langgraph_node` 필터 |
-
-스트리밍 중 `AIMessageChunk`를 누적(`chunk + chunk`)해 저장소에 반영하므로 LLM을 한 번만 호출합니다.
+| RAG + Rerank | `retrieve_node(k=6)` → `rerank_node` → `rag_chat_node` |
+| 토큰 스트리밍 | `stream_mode=["messages", "updates"]` |
+| 출처 표시 | rerank_node 완료 시 sources 캡처 → 스트림 후 출력 |
 
 **등록된 도구**
 - `get_time`: 현재 시각
@@ -249,24 +304,18 @@ START → router_node → (tool_agent_node | direct_chat_node) → END
 - `remember_fact`: 사실 기억
 
 ```bash
-uv run python 09_chatbot.py
+uv run python chatbot.py
 ```
 
 대화 루프가 실행됩니다. `quit` 입력 시 종료.
 
 ---
 
-```bash
-uv run python 10_skills.py
-```
-
----
-
 ## 학습 순서
 
 ```
-01 → 02 → 03 → 04 → 05 → 06 → 07 → 08 → 09 → 10
-기초   도구  MCP  메모리 분기  스트림 HITL  멀티   종합  스킬
+01 → 02 → 03 → 04 → 05 → 06 → 07 → 08 → 09 → 10 → chatbot
+기초   도구  MCP  메모리 분기  스트림 HITL  멀티   RAG  Rerank  종합
 ```
 
 ## 문제 해결
