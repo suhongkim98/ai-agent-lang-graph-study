@@ -16,10 +16,11 @@ from datetime import datetime
 from typing import Annotated, Literal
 
 from langchain_core.documents import Document
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langchain.agents import create_agent as create_react_agent
@@ -242,21 +243,28 @@ def rerank_node(state: State) -> State:
 
 def rag_chat_node(state: State) -> State:
     """검색된 문서를 컨텍스트로 포함해 LLM이 답변합니다.
-    rerank 후 통과 문서가 없으면 LLM 호출 없이 바로 답변불가를 반환합니다."""
-    from langchain_core.messages import AIMessage
-
-    if not state["context"]:
-        return {"messages": [AIMessage(content=f"{_UNANSWERABLE_PREFIX}.")]}
-
-    context_text = "\n\n".join(state["context"])
+    문서가 없으면 대화 기록에서 답변을 시도하고, 기록에도 없으면 답변불가를 반환합니다."""
     last_question = state["messages"][-1].content
+    history = list(state["messages"][:-1])
+
+    # 문서가 없을 경우 → 대화 기록에서만 답변 시도 (일반 지식 사용 금지)
+    if not state["context"]:
+        history_prompt = (
+            f"아래 대화 기록에 근거해 질문에 답하세요.\n"
+            f'대화 기록에서 찾을 수 없으면 반드시 "{_UNANSWERABLE_PREFIX}"로 시작하세요.\n\n'
+            f"[질문]\n{last_question}"
+        )
+        response = llm.invoke([SYSTEM] + history + [{"role": "user", "content": history_prompt}])
+        return {"messages": [response]}
+
+    # 검색된 문서가 있다면
+    context_text = "\n\n".join(state["context"])
     rag_prompt = (
-        f"다음 문서를 참고해 질문에 답하세요.\n"
-        f'문서로 답할 수 없으면 반드시 "{_UNANSWERABLE_PREFIX}"로 시작하세요.\n\n'
+        f"다음 문서와 대화 기록을 참고해 질문에 답하세요.\n"
+        f'문서와 대화 기록으로 답할 수 없으면 반드시 "{_UNANSWERABLE_PREFIX}"로 시작하세요.\n\n'
         f"[참고 문서]\n{context_text}\n\n"
         f"[질문]\n{last_question}"
     )
-    history = list(state["messages"][:-1])
     response = llm.invoke([SYSTEM] + history + [{"role": "user", "content": rag_prompt}])
     return {"messages": [response]}
 
@@ -268,19 +276,25 @@ _tool_agent = create_react_agent(llm, TOOLS, system_prompt=SYSTEM)
 def tool_agent_node(state: State) -> State:
     """ReAct 에이전트를 스트리밍으로 실행하며 도구 호출 과정을 출력합니다."""
     final_msg = None
-    for chunk in _tool_agent.stream(
-        {"messages": state["messages"]},
-        stream_mode="updates",
-    ):
-        for _node, delta in chunk.items():
-            for msg in delta.get("messages", []):
-                if hasattr(msg, "tool_calls") and msg.tool_calls:
-                    names = ", ".join(tc["name"] for tc in msg.tool_calls)
-                    print(f"\n  → 도구 호출: {names}", flush=True)
-                elif hasattr(msg, "name") and msg.name:  # ToolMessage (도구 결과)
-                    print(f"  → [{msg.name}] {msg.content}", flush=True)
-                elif msg.content:
-                    final_msg = msg
+    try:
+        for chunk in _tool_agent.stream(
+            {"messages": state["messages"]},
+            stream_mode="updates",
+            config={"recursion_limit": 10},
+        ):
+            for _node, delta in chunk.items():
+                for msg in delta.get("messages", []):
+                    if hasattr(msg, "tool_calls") and msg.tool_calls:
+                        names = ", ".join(tc["name"] for tc in msg.tool_calls)
+                        print(f"\n  → 도구 호출: {names}", flush=True)
+                    elif hasattr(msg, "name") and msg.name:  # ToolMessage (도구 결과)
+                        print(f"  → [{msg.name}] {msg.content}", flush=True)
+                    elif msg.content:
+                        final_msg = msg
+    except GraphRecursionError:
+        print("\n  → [경고] 도구 호출 반복 한도(10) 초과", flush=True)
+        if final_msg is None:
+            final_msg = AIMessage(content="도구 실행 중 반복 한도를 초과했습니다.")
     return {"messages": [final_msg] if final_msg else []}
 
 
@@ -333,6 +347,7 @@ def chat(thread_id: str = "user-1"):
         print("AI", end="", flush=True)
         ai_chunk = None
         sources_captured: list[str] = []
+        tool_update_msg = None  # messages 모드 미캡처 시 fallback용
 
         for mode, chunk in graph.stream(
             {
@@ -347,6 +362,10 @@ def chat(thread_id: str = "user-1"):
             if mode == "updates":
                 if "rerank_node" in chunk:
                     sources_captured = chunk["rerank_node"].get("sources", [])
+                elif "tool_agent_node" in chunk:
+                    msgs = chunk["tool_agent_node"].get("messages", [])
+                    if msgs and msgs[-1].content:
+                        tool_update_msg = msgs[-1]
             elif mode == "messages":
                 token, metadata = chunk
                 if metadata.get("langgraph_node") in ANSWER_NODES and token.content:
@@ -357,6 +376,10 @@ def chat(thread_id: str = "user-1"):
         answer_text = ai_chunk.content.strip() if ai_chunk else ""
         if sources_captured and not answer_text.startswith(_UNANSWERABLE_PREFIX):
             print(f"\n출처: {' · '.join(sources_captured)}", end="", flush=True)
+
+        # 도구 경로: messages 모드에서 캡처되지 않은 경우 updates에서 가져와 메모리에 저장
+        if ai_chunk is None:
+            ai_chunk = tool_update_msg
 
         if ai_chunk is not None:
             store[thread_id] = history + [HumanMessage(content=user_input), ai_chunk]

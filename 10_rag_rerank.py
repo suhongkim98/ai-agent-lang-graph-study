@@ -1,6 +1,7 @@
 """
 10. RAG + Reranker — 검색 → 재정렬 → 생성
 벡터 검색으로 후보를 넓게 뽑은 뒤 LLM이 관련성을 점수화해 상위 문서만 선별합니다.
+rerank 후 통과 문서가 없으면 LLM 호출 없이 즉시 답변불가를 반환
 
 그래프 구조:
   START → retrieve → rerank → generate → END

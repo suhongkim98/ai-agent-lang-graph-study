@@ -297,10 +297,10 @@ START → router → tool_agent                       → END  (도구 필요 �
 |------|------|
 | 메모리 | Python `dict` + `thread_id` |
 | 도구 자동 선택 | `router_node`가 LLM으로 판단 |
-| 도구 실행 | `tool_agent_node` (ReAct) — 호출 도구명·결과 터미널 출력 |
+| 도구 실행 | `tool_agent_node` (ReAct) — 호출 도구명·결과 터미널 출력, `recursion_limit=10`으로 무한루프 방지 |
 | RAG + Rerank | `retrieve_node(k=6)` → `rerank_node(MIN_SCORE=5.0)` → `rag_chat_node` |
 | 토큰 스트리밍 | `stream_mode=["messages", "updates"]` |
-| 답변 가능 여부 판단 | `context`가 비면 LLM 호출 없이 즉시 답변불가 반환 — LLM의 파라메트릭 지식으로 억지 답변하는 것을 차단 |
+| 답변 가능 여부 판단 | `context` 있음 → 문서 기반 답변 / `context` 없음 → 대화 기록으로 재시도 → 기록에도 없으면 답변불가 반환 |
 | 출처 표시 | 답변 가능 시만 표시 — 불가 시 출처 생략 |
 
 **등록된 도구**
