@@ -22,7 +22,7 @@ from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent as create_react_agent
 from typing_extensions import TypedDict
 
 
@@ -257,7 +257,7 @@ def rag_chat_node(state: State) -> State:
 
 
 # 도구 에이전트 — create_react_agent를 노드로 래핑
-_tool_agent = create_react_agent(llm, TOOLS, prompt=SYSTEM)
+_tool_agent = create_react_agent(llm, TOOLS, system_prompt=SYSTEM)
 
 
 def tool_agent_node(state: State) -> State:

@@ -17,7 +17,7 @@ from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent as create_react_agent
 from typing_extensions import TypedDict
 
 
@@ -59,13 +59,13 @@ def search_knowledge(query: str) -> str:
 math_agent = create_react_agent(
     llm,
     [calculate],
-    prompt=SystemMessage("당신은 수학 전문가입니다. 계산 도구를 활용해 정확히 계산하세요."),
+    system_prompt=SystemMessage("당신은 수학 전문가입니다. 계산 도구를 활용해 정확히 계산하세요."),
 )
 
 research_agent = create_react_agent(
     llm,
     [search_knowledge],
-    prompt=SystemMessage("당신은 리서치 전문가입니다. 지식 베이스를 검색해 정확한 정보를 제공하세요."),
+    system_prompt=SystemMessage("당신은 리서치 전문가입니다. 지식 베이스를 검색해 정확한 정보를 제공하세요."),
 )
 
 # --- Supervisor 상태 ---

@@ -15,7 +15,7 @@ from pathlib import Path
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_ollama import ChatOllama
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent as create_react_agent
 
 
 SERVER_SCRIPT = str(Path(__file__).parent / "03_mcp_server.py")

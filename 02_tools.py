@@ -6,7 +6,7 @@ LLM이 스스로 도구를 선택하고 호출하는 패턴을 익힙니다.
 from datetime import datetime
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent as create_react_agent
 
 
 # 1. 도구 정의 — @tool 데코레이터로 LLM이 호출할 수 있는 함수를 등록

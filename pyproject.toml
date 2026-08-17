@@ -1,12 +1,13 @@
 [project]
 name = "langgraph-study"
 version = "0.1.0"
-description = "Add your description here"
+description = "LangGraph를 공부하기 위한 프로젝트"
 authors = [
     { name = "suhongkim98", email = "kshz9815@naver.com" }
 ]
 requires-python = ">=3.14"
 dependencies = [
+    "langchain>=1.3.15",
     "langchain-mcp-adapters>=0.3.2",
     "langchain-ollama>=1.1.0",
     "langgraph>=1.2.11",

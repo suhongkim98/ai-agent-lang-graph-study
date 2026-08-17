@@ -12,7 +12,7 @@ from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent as create_react_agent
 from typing_extensions import TypedDict
 
 
