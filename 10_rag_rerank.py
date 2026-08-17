@@ -184,7 +184,9 @@ _UNANSWERABLE_PREFIX = "문서에 없는 내용입니다"
 
 def generate(state: State) -> State:
     """선별된 문서로 답변을 생성합니다.
-    문서로 답할 수 없으면 출처를 표시하지 않습니다."""
+    rerank 후 통과 문서가 없으면 LLM 호출 없이 즉시 답변불가를 반환합니다."""
+    if not state["documents"]:
+        return {"answer": f"{_UNANSWERABLE_PREFIX}."}
     context = "\n\n".join(state["documents"])
     prompt = (
         "다음 문서를 참고해 질문에 답하세요.\n"

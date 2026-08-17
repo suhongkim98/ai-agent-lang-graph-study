@@ -242,7 +242,12 @@ def rerank_node(state: State) -> State:
 
 def rag_chat_node(state: State) -> State:
     """검색된 문서를 컨텍스트로 포함해 LLM이 답변합니다.
-    문서로 답할 수 없을 때는 _UNANSWERABLE_PREFIX로 시작하도록 지시합니다."""
+    rerank 후 통과 문서가 없으면 LLM 호출 없이 바로 답변불가를 반환합니다."""
+    from langchain_core.messages import AIMessage
+
+    if not state["context"]:
+        return {"messages": [AIMessage(content=f"{_UNANSWERABLE_PREFIX}.")]}
+
     context_text = "\n\n".join(state["context"])
     last_question = state["messages"][-1].content
     rag_prompt = (
@@ -261,8 +266,22 @@ _tool_agent = create_react_agent(llm, TOOLS, system_prompt=SYSTEM)
 
 
 def tool_agent_node(state: State) -> State:
-    result = _tool_agent.invoke({"messages": state["messages"]})
-    return {"messages": [result["messages"][-1]]}
+    """ReAct 에이전트를 스트리밍으로 실행하며 도구 호출 과정을 출력합니다."""
+    final_msg = None
+    for chunk in _tool_agent.stream(
+        {"messages": state["messages"]},
+        stream_mode="updates",
+    ):
+        for _node, delta in chunk.items():
+            for msg in delta.get("messages", []):
+                if hasattr(msg, "tool_calls") and msg.tool_calls:
+                    names = ", ".join(tc["name"] for tc in msg.tool_calls)
+                    print(f"\n  → 도구 호출: {names}", flush=True)
+                elif hasattr(msg, "name") and msg.name:  # ToolMessage (도구 결과)
+                    print(f"  → [{msg.name}] {msg.content}", flush=True)
+                elif msg.content:
+                    final_msg = msg
+    return {"messages": [final_msg] if final_msg else []}
 
 
 def route(state: State) -> Literal["tool_agent_node", "retrieve_node"]:
@@ -310,9 +329,8 @@ def chat(thread_id: str = "user-1"):
 
         history = store.setdefault(thread_id, [])
 
-        # 스트리밍 + 출처 캡처
-        # stream_mode 리스트를 쓰면 (mode, chunk) 튜플로 yield됨
-        print("AI: ", end="", flush=True)
+        # stream_mode 리스트: (mode, chunk) 튜플로 yield됨
+        print("AI", end="", flush=True)
         ai_chunk = None
         sources_captured: list[str] = []
 
@@ -326,8 +344,9 @@ def chat(thread_id: str = "user-1"):
             },
             stream_mode=["messages", "updates"],
         ):
-            if mode == "updates" and "rerank_node" in chunk:
-                sources_captured = chunk["rerank_node"].get("sources", [])
+            if mode == "updates":
+                if "rerank_node" in chunk:
+                    sources_captured = chunk["rerank_node"].get("sources", [])
             elif mode == "messages":
                 token, metadata = chunk
                 if metadata.get("langgraph_node") in ANSWER_NODES and token.content:

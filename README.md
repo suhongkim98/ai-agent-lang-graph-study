@@ -52,6 +52,7 @@ ollama serve
 | 패키지 | 역할 |
 |--------|------|
 | `langgraph` | 그래프 기반 LLM 오케스트레이션 |
+| `langchain` | `create_agent` (구 `create_react_agent`) 제공 |
 | `langchain-ollama` | Ollama ↔ LangChain 연결 |
 | `langchain-mcp-adapters` | MCP 서버 도구를 LangChain으로 변환 |
 | `mcp` | MCP 서버 구현 |
@@ -242,6 +243,7 @@ START → retrieve → generate → END
 - `OllamaEmbeddings`: 로컬 임베딩 모델(`nomic-embed-text`)로 문서 인덱싱
 - `similarity_search(query, k=3)`: 질문과 가장 유사한 문서 k개 반환
 - RAG 패턴: `retrieve` 노드(문서 검색) → `generate` 노드(컨텍스트 기반 답변)
+- 답변 가능 여부 판단: 검색 결과가 없으면 LLM 호출 없이 즉시 답변불가 반환
 - 출처 표시: 문서로 답변 가능한 경우에만 출처를 표시하고, 답변 불가 시 생략
 
 ```bash
@@ -263,7 +265,7 @@ START → retrieve(k=6) → rerank → generate → END
 **핵심 개념**
 - `retrieve`: 임베딩 유사도로 후보 `RETRIEVE_K=6`개를 넓게 검색
 - `rerank`: LLM이 각 후보에 0~10점 부여 → `MIN_RERANK_SCORE=5.0` 이상만 통과 → 상위 `RERANK_TOP_K=3`개 선별
-- `generate`: 선별된 문서로 답변 생성 — 통과 문서가 없으면 LLM이 답변 불가 신호를 보냄
+- `generate`: 선별된 문서로 답변 생성 — 통과 문서가 없으면 LLM 호출 없이 즉시 답변불가 반환
 - 출처 표시: 문서로 답변 가능한 경우에만 표시
 - 점수 결과(`✓` 선택 / `✗` 임계값 미달)가 터미널에 출력되어 선별 과정이 눈에 보임
 
@@ -295,9 +297,10 @@ START → router → tool_agent                       → END  (도구 필요 �
 |------|------|
 | 메모리 | Python `dict` + `thread_id` |
 | 도구 자동 선택 | `router_node`가 LLM으로 판단 |
-| 도구 실행 | `tool_agent_node` (ReAct) |
+| 도구 실행 | `tool_agent_node` (ReAct) — 호출 도구명·결과 터미널 출력 |
 | RAG + Rerank | `retrieve_node(k=6)` → `rerank_node(MIN_SCORE=5.0)` → `rag_chat_node` |
 | 토큰 스트리밍 | `stream_mode=["messages", "updates"]` |
+| 답변 가능 여부 판단 | `context`가 비면 LLM 호출 없이 즉시 답변불가 반환 — LLM의 파라메트릭 지식으로 억지 답변하는 것을 차단 |
 | 출처 표시 | 답변 가능 시만 표시 — 불가 시 출처 생략 |
 
 **등록된 도구**
