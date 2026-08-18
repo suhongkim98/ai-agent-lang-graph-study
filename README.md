@@ -295,7 +295,8 @@ START → router → tool_agent                       → END  (도구 필요 �
 
 | 기능 | 구현 |
 |------|------|
-| 메모리 | Python `dict` + `thread_id` |
+| 메모리 | Python `dict` + `thread_id` — 도구 호출 결과도 이력에 저장 |
+| 사용자 입력 정리 | `.encode("utf-8", errors="replace")` 로 깨진 유니코드 문자 제거 + 앞뒤 공백 제거 |
 | 도구 자동 선택 | `router_node`가 LLM으로 판단 |
 | 도구 실행 | `tool_agent_node` (ReAct) — 호출 도구명·결과 터미널 출력, `recursion_limit=10`으로 무한루프 방지 |
 | RAG + Rerank | `retrieve_node(k=6)` → `rerank_node(MIN_SCORE=5.0)` → `rag_chat_node` |
@@ -316,11 +317,55 @@ uv run python chatbot.py
 
 ---
 
+### 종합 챗봇 v2 (Supervisor) — `supervisor_chatbot.py`
+
+`intent_classification`이 작업 순서(계획)를 수립하고, `supervisor`가 한 단계씩 워커를 오케스트레이션하는 멀티 에이전트 챗봇입니다.
+
+```
+START → intent_classification ─┐
+                               ↓ (계획의 첫 단계로 라우팅)
+            supervisor ─┬→ retrieve → rerank → rag_chat ─┐
+                        ├→ tool_agent ────────────────────┤ (결과는 supervisor로 반환)
+                        └→ final_answer → END
+```
+
+**핵심 노드**
+
+| 노드 | 역할 |
+|------|------|
+| `intent_classification_node` | 사용자 요청 + 대화 기록 분석 → `PLAN`(작업 순서) + `REQUEST`(단계별 지시문) 출력 |
+| `supervisor_node` | 계획을 한 단계씩 실행 — 워커에게 위임하고, 완료 후 `final_answer`로 전달 (`MAX_SUPERVISOR_STEPS=10`) |
+| `rag_chat_node` | 검색된 문서 근거로 정보 정리 → `findings`에 누적 |
+| `tool_agent_node` | ReAct 도구 실행 → 결과를 `findings`에 누적 |
+| `final_answer_node` | 누적된 `findings` + 대화 기록 종합 → 최종 답변 생성 |
+
+**`chatbot.py`와의 차이**
+
+| 항목 | `chatbot.py` | `supervisor_chatbot.py` |
+|------|-------------|------------------------|
+| 라우팅 | `router_node` 단순 1회 분기 | `intent_classification` → 다단계 계획 |
+| 작업 처리 | tools 또는 RAG 중 하나 | `tools → rag → tools` 등 복합 순서 가능 |
+| 결과 축적 | 없음 (워커가 직접 최종 답변) | `findings` 누적 후 `final_answer_node`가 종합 |
+| 디버그 출력 | 도구 호출명·결과 | 의도 분류 결과, supervisor 단계 진행 상황 추가 출력 |
+
+**등록된 도구**
+- `get_time`: 현재 시각
+- `calculate`: 수식 계산
+- `remember_fact`: 사실 기억
+
+```bash
+uv run python supervisor_chatbot.py
+```
+
+대화 루프가 실행됩니다. `quit` 입력 시 종료. 의도 분류와 supervisor 진행 상황이 터미널에 출력됩니다.
+
+---
+
 ## 학습 순서
 
 ```
-01 → 02 → 03 → 04 → 05 → 06 → 07 → 08 → 09 → 10 → chatbot
-기초   도구  MCP  메모리 분기  스트림 HITL  멀티   RAG  Rerank  종합
+01 → 02 → 03 → 04 → 05 → 06 → 07 → 08 → 09 → 10 → chatbot → supervisor_chatbot
+기초   도구  MCP  메모리 분기  스트림 HITL  멀티   RAG  Rerank  종합         Supervisor
 ```
 
 ## 문제 해결

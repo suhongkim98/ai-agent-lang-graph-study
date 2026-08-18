@@ -2,6 +2,8 @@
 RAG 챗봇 — 지금까지 배운 것을 하나로 + 문서 기반 정확한 답변
 메모리 + 조건부 라우팅 + 도구 호출 + 스트리밍 + RAG + Reranker를 결합합니다.
 
+사용자가 질문을 하면 그 질문만 보고 RAG 검색할지, MCP 도구를 호출할지 라우팅하는 단순한 구조입니다.
+
 그래프 구조:
   START → router → tool_agent                          → END  (도구 필요 시)
                  → retrieve → rerank → rag_chat        → END  (일반 질문 → RAG + Rerank)
@@ -25,6 +27,17 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langchain.agents import create_agent as create_react_agent
 from typing_extensions import TypedDict
+
+
+# ── 유틸 ─────────────────────────────────
+
+def _parse_score(text: str) -> float:
+    """thinking 태그를 제거하고 첫 번째 숫자를 0~10으로 클램핑합니다."""
+    clean = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    match = re.search(r"\b(\d+(?:\.\d+)?)\b", clean)
+    if not match:
+        return 0.0
+    return min(10.0, max(0.0, float(match.group(1))))
 
 
 # ── 도구 ──────────────────────────────────────────
@@ -63,6 +76,16 @@ def remember_fact(fact: str) -> str:
 
 TOOLS = [get_time, calculate, remember_fact]
 
+
+def _format_tools(tools) -> str:
+    """도구 이름과 설명(첫 줄)을 프롬프트용 문자열로 만듭니다."""
+    return "\n".join(
+        f"  · {t.name}: {t.description.strip().splitlines()[0]}" for t in tools
+    )
+
+
+TOOLS_DESC = _format_tools(TOOLS)
+
 RETRIEVE_K = 6              # 벡터 검색 후보 수
 RERANK_TOP_K = 3            # 리랭킹 후 선택 수
 MIN_RERANK_SCORE = 5.0      # 이 점수 미만 문서는 컨텍스트에서 제외
@@ -74,12 +97,6 @@ _UNANSWERABLE_PREFIX = "문서에 없는 내용입니다"
 llm = ChatOllama(model="qwen3:8b", temperature=0)
 embeddings = OllamaEmbeddings(model="nomic-embed-text")
 vector_store = InMemoryVectorStore(embeddings)
-
-SYSTEM = SystemMessage(
-    "당신은 친절하고 유능한 AI 어시스턴트입니다. "
-    "계산이나 시간 조회가 필요하면 도구를 사용하세요. "
-    "사용자가 중요한 정보를 알려주면 remember_fact 도구로 기억하세요."
-)
 
 # ── 지식 베이스 ────────────────────────────────────
 
@@ -160,26 +177,6 @@ _KNOWLEDGE = [
 
 vector_store.add_documents(_KNOWLEDGE)
 
-# ── Reranker 유틸 ─────────────────────────────────
-
-_SCORE_PROMPT = """\
-질문과 문서의 관련성을 0~10점으로 평가하세요.
-숫자 하나만 출력하세요.
-
-질문: {question}
-문서: {content}
-점수:"""
-
-
-def _parse_score(text: str) -> float:
-    """thinking 태그를 제거하고 첫 번째 숫자를 0~10으로 클램핑합니다."""
-    clean = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-    match = re.search(r"\b(\d+(?:\.\d+)?)\b", clean)
-    if not match:
-        return 0.0
-    return min(10.0, max(0.0, float(match.group(1))))
-
-
 # ── 상태 ───────────────────────────────────────────
 
 class State(TypedDict):
@@ -192,10 +189,8 @@ class State(TypedDict):
 
 # ── 노드 ───────────────────────────────────────────
 
-ROUTE_PROMPT = """사용자 메시지가 다음 중 하나에 해당하면 'tools'라고만 답하고, 아니면 'chat'이라고만 답하세요.
-- 수학 계산
-- 현재 시간/날짜 조회
-- 기억 요청 ("기억해줘", "저장해줘" 등)
+ROUTE_PROMPT = """사용자 메시지에 다음 도구 중 하나라도 필요하면 'tools'라고만 답하고, 아니면 'chat'이라고만 답하세요.
+{tools_desc}
 
 메시지: {message}
 분류:"""
@@ -203,7 +198,8 @@ ROUTE_PROMPT = """사용자 메시지가 다음 중 하나에 해당하면 'tool
 
 def router_node(state: State) -> State:
     last = state["messages"][-1].content
-    result = llm.invoke([{"role": "user", "content": ROUTE_PROMPT.format(message=last)}])
+    result = llm.invoke([{"role": "user", "content": ROUTE_PROMPT.format(
+        message=last, tools_desc=TOOLS_DESC)}])
     use_tools = "tools" in result.content.lower()
     return {"use_tools": use_tools}
 
@@ -224,6 +220,14 @@ def retrieve_node(state: State) -> State:
 
 
 def rerank_node(state: State) -> State:
+    _SCORE_PROMPT = """\
+    질문과 문서의 관련성을 0~10점으로 평가하세요.
+    숫자 하나만 출력하세요.
+
+    질문: {question}
+    문서: {content}
+    점수:"""
+
     """LLM으로 각 후보에 0~10점을 부여하고 상위 RERANK_TOP_K개를 선별합니다."""
     question = state["messages"][-1].content
     scored = []
@@ -242,6 +246,12 @@ def rerank_node(state: State) -> State:
 
 
 def rag_chat_node(state: State) -> State:
+    RAG_SYSTEM = SystemMessage(
+        "당신은 문서 기반 질의응답 전문가입니다. "
+        "제공된 참고 문서와 대화 기록에 근거해서만 답하고, 그 밖의 내용은 추측하지 마세요. "
+        "질문에 친절하고 명확한 한국어로 답변하세요."
+    )
+
     """검색된 문서를 컨텍스트로 포함해 LLM이 답변합니다.
     문서가 없으면 대화 기록에서 답변을 시도하고, 기록에도 없으면 답변불가를 반환합니다."""
     last_question = state["messages"][-1].content
@@ -254,7 +264,7 @@ def rag_chat_node(state: State) -> State:
             f'대화 기록에서 찾을 수 없으면 반드시 "{_UNANSWERABLE_PREFIX}"로 시작하세요.\n\n'
             f"[질문]\n{last_question}"
         )
-        response = llm.invoke([SYSTEM] + history + [{"role": "user", "content": history_prompt}])
+        response = llm.invoke([RAG_SYSTEM] + history + [{"role": "user", "content": history_prompt}])
         return {"messages": [response]}
 
     # 검색된 문서가 있다면
@@ -265,12 +275,15 @@ def rag_chat_node(state: State) -> State:
         f"[참고 문서]\n{context_text}\n\n"
         f"[질문]\n{last_question}"
     )
-    response = llm.invoke([SYSTEM] + history + [{"role": "user", "content": rag_prompt}])
+    response = llm.invoke([RAG_SYSTEM] + history + [{"role": "user", "content": rag_prompt}])
     return {"messages": [response]}
 
 
 # 도구 에이전트 — create_react_agent를 노드로 래핑
-_tool_agent = create_react_agent(llm, TOOLS, system_prompt=SYSTEM)
+_tool_agent = create_react_agent(llm, TOOLS, system_prompt=SystemMessage(
+    "당신은 도구를 활용하는 유능한 어시스턴트입니다. "
+    "도구 결과를 사실 그대로 사용하고 값을 임의로 지어내지 마세요."
+))
 
 
 def tool_agent_node(state: State) -> State:
