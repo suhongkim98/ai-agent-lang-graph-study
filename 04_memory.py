@@ -1,23 +1,20 @@
 """
-04. 멀티턴 대화 메모리 — Python dict 기반
-MemorySaver(LangGraph 체크포인터) 대신 dict로 thread_id별 메시지를 직접 관리합니다.
+04. 멀티턴 대화 메모리 — MemorySaver 기반
+LangGraph의 MemorySaver 체크포인터로 thread_id별 대화를 자동 관리합니다.
+운영환경에서는 PostgresSaver를 사용하자
 
 구조:
-  store: dict[thread_id, list[message]] — 대화 저장소
-  그래프는 체크포인터 없이 컴파일하고, 호출 전에 이전 메시지를 직접 주입합니다.
+  MemorySaver: thread_id별 체크포인트를 인메모리 dict에 저장
+  그래프를 checkpointer=memory로 컴파일하고, config에 thread_id를 전달합니다.
 """
 
 from typing import Annotated
 from langchain_core.messages import BaseMessage
 from langchain_ollama import ChatOllama
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
-
-
-# ── 대화 저장소 ────────────────────────────────────
-# { thread_id: [HumanMessage, AIMessage, ...] }
-store: dict[str, list[BaseMessage]] = {}
 
 
 # ── 그래프 ─────────────────────────────────────────
@@ -33,13 +30,14 @@ def chatbot(state: State) -> State:
     return {"messages": [llm.invoke(state["messages"])]}
 
 
-# 체크포인터 없이 컴파일 — 상태 관리를 직접 담당
+memory = MemorySaver()
+
 graph = (
     StateGraph(State)
     .add_node("chatbot", chatbot)
     .add_edge(START, "chatbot")
     .add_edge("chatbot", END)
-    .compile()
+    .compile(checkpointer=memory)
 )
 
 
@@ -47,30 +45,27 @@ graph = (
 
 def invoke(thread_id: str, user_message: str) -> str:
     """
-    thread_id 기준으로 이전 대화를 불러와 LLM에 전달하고,
-    응답을 다시 store에 저장합니다.
+    thread_id 기준으로 MemorySaver가 이전 대화를 자동으로 복원해
+    LLM에 전달하고, 응답을 체크포인트에 저장합니다.
     """
-    history = store.setdefault(thread_id, [])
-
-    # 이전 메시지 + 새 메시지를 함께 전달
-    result = graph.invoke({
-        "messages": history + [{"role": "user", "content": user_message}]
-    })
-
-    # 전체 메시지 목록을 저장소에 갱신
-    store[thread_id] = result["messages"]
-
+    config = {"configurable": {"thread_id": thread_id}}
+    result = graph.invoke(
+        {"messages": [{"role": "user", "content": user_message}]},
+        config=config,
+    )
     return result["messages"][-1].content
 
 
 def get_history(thread_id: str) -> list[BaseMessage]:
     """thread_id의 전체 대화 기록을 반환합니다."""
-    return store.get(thread_id, [])
+    config = {"configurable": {"thread_id": thread_id}}
+    state = graph.get_state(config)
+    return state.values.get("messages", []) if state.values else []
 
 
 def clear_history(thread_id: str) -> None:
     """thread_id의 대화 기록을 삭제합니다."""
-    store.pop(thread_id, None)
+    memory.storage.pop(thread_id, None)
 
 
 # ── 데모 ───────────────────────────────────────────
@@ -89,14 +84,16 @@ def demo_memory():
     print(f"You: 내 이름이 뭐야?")
     print(f"AI : {invoke('thread-B', '내 이름이 뭐야?')}\n")
 
-    print("=== store 현황 ===")
-    for tid, messages in store.items():
-        roles = [m.__class__.__name__ for m in messages]
-        print(f"  [{tid}] {len(messages)}개 메시지: {roles}")
+    print("=== 체크포인트 현황 ===")
+    for tid in ("thread-A", "thread-B"):
+        msgs = get_history(tid)
+        roles = [m.__class__.__name__ for m in msgs]
+        print(f"  [{tid}] {len(msgs)}개 메시지: {roles}")
 
 
 def chat(thread_id: str = "default"):
     """대화 루프 (종료: quit)"""
+    config = {"configurable": {"thread_id": thread_id}}
     print(f"대화 시작 (thread: {thread_id}) — 종료: quit\n")
     while True:
         user_input = input("You: ").encode("utf-8", errors="replace").decode("utf-8").strip()
@@ -104,7 +101,11 @@ def chat(thread_id: str = "default"):
             break
         if not user_input:
             continue
-        print(f"AI: {invoke(thread_id, user_input)}\n")
+        result = graph.invoke(
+            {"messages": [{"role": "user", "content": user_input}]},
+            config=config,
+        )
+        print(f"AI: {result['messages'][-1].content}\n")
 
 
 if __name__ == "__main__":

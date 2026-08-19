@@ -17,21 +17,21 @@ intent_classification: 사용자의 최초 요청을 분석해 어떤 작업(rag
 supervisor: intent_classification이 세운 계획을 한 단계씩 실행하며 워커
             (rag_chat / tool_agent)의 결과를 받아 다음 단계로 넘기고,
             계획을 모두 마치면 final_answer로 보냅니다.
-메모리  : Python dict로 thread_id별 메시지를 직접 관리합니다.
+메모리  : MemorySaver 체크포인터로 thread_id별 메시지를 자동 관리합니다.
 RAG     : InMemoryVectorStore + OllamaEmbeddings로 추가 패키지 없이 구동합니다.
 Reranker: LLM으로 각 후보를 0~10점 점수화해 상위 RERANK_TOP_K개만 선별합니다.
 """
 
-import operator
 import re
 from datetime import datetime
 from typing import Annotated, Literal
 
 from langchain_core.documents import Document
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -213,7 +213,7 @@ class State(TypedDict):
   candidates: list[dict]              # retrieve가 반환한 후보 (content, source)
   context: list[str]                  # rerank가 선별한 문서 내용
   sources: list[str]                  # 선별 문서의 출처
-  findings: Annotated[list[str], operator.add]  # 워커들이 수집한 정보 (누적)
+  findings: list[str]                  # 워커들이 수집한 정보 (누적)
   resolved_query: str                 # 현재 단계에서 워커에게 넘길 지시문 (supervisor가 매 단계 갱신)
   resolved_queries: list[str]         # 단계별 지시문 (plan과 1:1 대응, REQUEST를 -> 로 분해)
   plan: list[str]                     # 수행할 작업 순서 (예: ["tools", "rag", "tools"])
@@ -417,7 +417,7 @@ def rag_chat_node(state: State) -> State:
   # 문서를 찾지 못한 경우 → supervisor가 다른 행동을 판단하도록 그대로 알림
   if not state["context"]:
     print("  [rag] 관련 문서를 찾지 못함", flush=True)
-    return {"findings": [f"[RAG 결과] '{last_question}'에 대한 관련 문서를 찾지 못했습니다."]}
+    return {"findings": state.get("findings", []) + [f"[RAG 결과] '{last_question}'에 대한 관련 문서를 찾지 못했습니다."]}
 
   context_text = "\n\n".join(state["context"])
   rag_prompt = (
@@ -432,7 +432,7 @@ def rag_chat_node(state: State) -> State:
     "질문과 관련된 사실을 간결하게 정리하세요."
   ), {"role": "user", "content": rag_prompt}])
   print("  [rag] 문서 기반 정보 수집 완료", flush=True)
-  return {"findings": [f"[RAG 결과]\n{response.content}"]}
+  return {"findings": state.get("findings", []) + [f"[RAG 결과]\n{response.content}"]}
 
 
 # 도구 에이전트 — create_react_agent를 노드로 래핑
@@ -474,7 +474,7 @@ def tool_agent_node(state: State) -> State:
       final_msg = AIMessage(content="도구 실행 중 반복 한도를 초과했습니다.")
   content = final_msg.content if final_msg else "도구 실행 결과가 없습니다."
   print("  [tools] 도구 실행 완료", flush=True)
-  return {"findings": [f"[도구 결과]\n{content}"]}
+  return {"findings": state.get("findings", []) + [f"[도구 결과]\n{content}"]}
 
 
 def final_answer_node(state: State) -> State:
@@ -533,10 +533,6 @@ def supervisor_route(
 
 
 
-# ── 대화 저장소 ────────────────────────────────────
-# { thread_id: [HumanMessage, AIMessage, ...] }
-store: dict[str, list[BaseMessage]] = {}
-
 # ── 그래프 ─────────────────────────────────────────
 
 graph = (
@@ -557,13 +553,15 @@ graph = (
   .add_edge("rag_chat_node", "supervisor_node")   # 워커 결과를 supervisor로 반환
   .add_edge("tool_agent_node", "supervisor_node")  # 워커 결과를 supervisor로 반환
   .add_edge("final_answer_node", END)
-  .compile()
+  .compile(checkpointer=MemorySaver())
 )
 
 # ── 실행 ───────────────────────────────────────────
 
 def chat(thread_id: str = "user-1"):
   print("Supervisor 챗봇 시작 (종료: quit)\n")
+
+  config = {"configurable": {"thread_id": thread_id}}
 
   while True:
     user_input = input("You: ").encode("utf-8", errors="replace").decode("utf-8").strip()
@@ -572,8 +570,6 @@ def chat(thread_id: str = "user-1"):
     if not user_input:
       continue
 
-    history = store.setdefault(thread_id, [])
-
     # stream_mode 리스트: (mode, chunk) 튜플로 yield됨
     print("AI", end="", flush=True)
     ai_chunk = None
@@ -581,7 +577,7 @@ def chat(thread_id: str = "user-1"):
 
     for mode, chunk in graph.stream(
         {
-          "messages": history + [{"role": "user", "content": user_input}],
+          "messages": [{"role": "user", "content": user_input}],
           "candidates": [],
           "context": [],
           "sources": [],
@@ -593,6 +589,7 @@ def chat(thread_id: str = "user-1"):
           "next_action": "",
           "steps": 0,
         },
+        config=config,
         stream_mode=["messages", "updates"],
     ):
       if mode == "updates":
@@ -612,9 +609,6 @@ def chat(thread_id: str = "user-1"):
     answer_text = ai_chunk.content.strip() if ai_chunk else ""
     if sources_captured and not answer_text.startswith(_UNANSWERABLE_PREFIX):
       print(f"\n출처: {' · '.join(sources_captured)}", end="", flush=True)
-
-    if ai_chunk is not None:
-      store[thread_id] = history + [HumanMessage(content=user_input), ai_chunk]
 
     print("\n")
 

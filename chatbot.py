@@ -8,7 +8,7 @@ RAG 챗봇 — 지금까지 배운 것을 하나로 + 문서 기반 정확한 �
   START → router → tool_agent                          → END  (도구 필요 시)
                  → retrieve → rerank → rag_chat        → END  (일반 질문 → RAG + Rerank)
 
-메모리  : Python dict로 thread_id별 메시지를 직접 관리합니다.
+메모리  : MemorySaver 체크포인터로 thread_id별 메시지를 자동 관리합니다.
 RAG     : InMemoryVectorStore + OllamaEmbeddings로 추가 패키지 없이 구동합니다.
 Reranker: LLM으로 각 후보를 0~10점 점수화해 상위 RERANK_TOP_K개만 선별합니다.
 """
@@ -18,11 +18,12 @@ from datetime import datetime
 from typing import Annotated, Literal
 
 from langchain_core.documents import Document
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langgraph.errors import GraphRecursionError
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langchain.agents import create_agent as create_react_agent
@@ -317,11 +318,9 @@ def route(state: State) -> Literal["tool_agent_node", "retrieve_node"]:
 
 
 
-# ── 대화 저장소 ────────────────────────────────────
-# { thread_id: [HumanMessage, AIMessage, ...] }
-store: dict[str, list[BaseMessage]] = {}
-
 # ── 그래프 ─────────────────────────────────────────
+
+memory = MemorySaver()
 
 graph = (
     StateGraph(State)
@@ -336,7 +335,7 @@ graph = (
     .add_edge("rerank_node", "rag_chat_node")
     .add_edge("tool_agent_node", END)
     .add_edge("rag_chat_node", END)
-    .compile()
+    .compile(checkpointer=memory)
 )
 
 ANSWER_NODES = {"tool_agent_node", "rag_chat_node"}
@@ -347,6 +346,8 @@ ANSWER_NODES = {"tool_agent_node", "rag_chat_node"}
 def chat(thread_id: str = "user-1"):
     print("RAG 챗봇 시작 (종료: quit)\n")
 
+    config = {"configurable": {"thread_id": thread_id}}
+
     while True:
         user_input = input("You: ").encode("utf-8", errors="replace").decode("utf-8").strip()
         if user_input.lower() in ("quit", "exit", "q"):
@@ -354,22 +355,20 @@ def chat(thread_id: str = "user-1"):
         if not user_input:
             continue
 
-        history = store.setdefault(thread_id, [])
-
         # stream_mode 리스트: (mode, chunk) 튜플로 yield됨
         print("AI", end="", flush=True)
         ai_chunk = None
         sources_captured: list[str] = []
-        tool_update_msg = None  # messages 모드 미캡처 시 fallback용
 
         for mode, chunk in graph.stream(
             {
-                "messages": history + [{"role": "user", "content": user_input}],
+                "messages": [{"role": "user", "content": user_input}],
                 "use_tools": False,
                 "candidates": [],
                 "context": [],
                 "sources": [],
             },
+            config=config,
             stream_mode=["messages", "updates"],
         ):
             if mode == "updates":
@@ -378,7 +377,7 @@ def chat(thread_id: str = "user-1"):
                 elif "tool_agent_node" in chunk:
                     msgs = chunk["tool_agent_node"].get("messages", [])
                     if msgs and msgs[-1].content:
-                        tool_update_msg = msgs[-1]
+                        ai_chunk = msgs[-1]
             elif mode == "messages":
                 token, metadata = chunk
                 if metadata.get("langgraph_node") in ANSWER_NODES and token.content:
@@ -389,13 +388,6 @@ def chat(thread_id: str = "user-1"):
         answer_text = ai_chunk.content.strip() if ai_chunk else ""
         if sources_captured and not answer_text.startswith(_UNANSWERABLE_PREFIX):
             print(f"\n출처: {' · '.join(sources_captured)}", end="", flush=True)
-
-        # 도구 경로: messages 모드에서 캡처되지 않은 경우 updates에서 가져와 메모리에 저장
-        if ai_chunk is None:
-            ai_chunk = tool_update_msg
-
-        if ai_chunk is not None:
-            store[thread_id] = history + [HumanMessage(content=user_input), ai_chunk]
 
         print("\n")
 

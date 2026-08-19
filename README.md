@@ -124,17 +124,15 @@ uv run python 03_mcp_client.py
 
 ### 04. 멀티턴 메모리 — `04_memory.py`
 
-`MemorySaver` 대신 Python `dict`로 `thread_id`별 메시지 목록을 직접 관리합니다.
-그래프는 체크포인터 없이 컴파일하고, 호출 전에 이전 메시지를 직접 주입합니다.
+LangGraph의 `MemorySaver` 체크포인터로 `thread_id`별 대화를 자동 관리합니다.
+그래프를 `checkpointer=memory`로 컴파일하고, `config`에 `thread_id`를 전달합니다.
 
 **핵심 개념**
-- `store: dict[str, list[BaseMessage]]`: thread_id → 메시지 목록 저장소
+- `MemorySaver`: 인메모리 dict에 thread_id별 체크포인트를 자동 저장·복원
 - `thread_id`: 대화 세션 식별자. 다른 ID면 독립된 대화
-- `invoke(thread_id, message)`: 히스토리를 꺼내 주입하고, 결과를 다시 저장
-
-**MemorySaver 대비 장점**
-- `store` dict를 직접 접근해 기록 조회(`get_history`) / 삭제(`clear_history`) 가능
-- JSON 직렬화 등 외부 저장소 연동 시 확장이 쉬움
+- `config = {"configurable": {"thread_id": ...}}`: invoke/stream 시 체크포인트 식별자 전달
+- `graph.get_state(config)`: 저장된 상태(대화 기록)를 조회
+- `memory.storage.pop(thread_id)`: 특정 스레드의 기록 삭제
 
 ```bash
 uv run python 04_memory.py
@@ -295,7 +293,7 @@ START → router → tool_agent                       → END  (도구 필요 �
 
 | 기능 | 구현 |
 |------|------|
-| 메모리 | Python `dict` + `thread_id` — 도구 호출 결과도 이력에 저장 |
+| 메모리 | `MemorySaver` + `thread_id` — 체크포인터가 대화 이력을 자동 관리 |
 | 사용자 입력 정리 | `.encode("utf-8", errors="replace")` 로 깨진 유니코드 문자 제거 + 앞뒤 공백 제거 |
 | 도구 자동 선택 | `router_node`가 LLM으로 판단 |
 | 도구 실행 | `tool_agent_node` (ReAct) — 호출 도구명·결과 터미널 출력, `recursion_limit=10`으로 무한루프 방지 |
@@ -346,6 +344,7 @@ START → intent_classification ─┐
 | 라우팅 | `router_node` 단순 1회 분기 | `intent_classification` → 다단계 계획 |
 | 작업 처리 | tools 또는 RAG 중 하나 | `tools → rag → tools` 등 복합 순서 가능 |
 | 결과 축적 | 없음 (워커가 직접 최종 답변) | `findings` 누적 후 `final_answer_node`가 종합 |
+| 메모리 | `MemorySaver` + `thread_id` | `MemorySaver` + `thread_id` |
 | 디버그 출력 | 도구 호출명·결과 | 의도 분류 결과, supervisor 단계 진행 상황 추가 출력 |
 
 **등록된 도구**
