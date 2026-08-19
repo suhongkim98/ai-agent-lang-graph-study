@@ -35,6 +35,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
+from langgraph.types import Command, interrupt
 from langchain.agents import create_agent as create_react_agent
 from typing_extensions import TypedDict
 
@@ -57,17 +58,22 @@ def _parse_score(text: str) -> float:
   return min(10.0, max(0.0, float(match.group(1))))
 
 
-def _parse_intent(text: str) -> tuple[list[str], list[str]]:
-  """intent 분류 결과에서 (계획, 단계별 정리된 요청)을 뽑습니다.
+def _parse_intent(text: str) -> tuple[list[str], list[str], str | None]:
+  """intent 분류 결과에서 (계획, 단계별 정리된 요청, 명확화 질문)을 뽑습니다.
 
-  LLM은 아래 형식으로 답합니다.
-    PLAN: tools -> rag -> tools
-    REQUEST: <1단계 지시문> -> <2단계 지시문> -> <3단계 지시문>
-  PLAN과 REQUEST 모두 화살표(->)로 구분되며, 같은 순서끼리 대응합니다.
-  (REQUEST[i]는 PLAN[i] 단계에서 워커에게 넘길 지시문)
-  계획은 PLAN 줄에서만 rag/tools를 추출해, 정리된 요청 본문의 단어에 오염되지 않습니다.
+  LLM은 아래 두 형식 중 하나로 답합니다.
+  · 의도 명확:
+      PLAN: tools -> rag -> tools
+      REQUEST: <1단계 지시문> -> <2단계 지시문> -> <3단계 지시문>
+  · 의도 모호:
+      CLARIFY: <사용자에게 물어볼 한 가지 핵심 질문>
+  반환값의 세 번째 원소가 None이 아니면 CLARIFY 케이스입니다.
   """
   clean = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+  clarify_match = re.search(r"CLARIFY\s*[:：]\s*(.+)", clean, flags=re.IGNORECASE)
+  if clarify_match:
+    return [], [], clarify_match.group(1).strip()
 
   plan_match = re.search(r"PLAN\s*[:：]\s*(.+)", clean, flags=re.IGNORECASE)
   plan_line = plan_match.group(1) if plan_match else ""
@@ -76,7 +82,7 @@ def _parse_intent(text: str) -> tuple[list[str], list[str]]:
   req_match = re.search(r"REQUEST\s*[:：]\s*(.+)", clean, flags=re.IGNORECASE | re.DOTALL)
   req_line = req_match.group(1).strip() if req_match else ""
   requests = [r.strip() for r in req_line.split("->") if r.strip()]
-  return plan, requests
+  return plan, requests, None
 
 # ── 도구 ──────────────────────────────────────────
 
@@ -248,6 +254,9 @@ INTENT_PROMPT = """당신은 멀티 에이전트 파이프라인의 첫 번째 �
 3. 최소화 검증: 각 단계를 빼도 답이 완성되는지 되묻고, 불필요한 단계는 제거한다.
    확신이 없는 사실 질문은 추측으로 답하지 말고 rag를 넣는다.
    도구 목록에 없는 기능은 절대 tools로 계획하지 않는다.
+4. 모호성 검사: 1~3 단계를 마쳤는데도 올바른 계획을 세우기 어려울 만큼 요청이 모호하면
+   CLARIFY를 선택한다. 단, 합리적으로 추론 가능한 경우에는 CLARIFY를 쓰지 않는다.
+   CLARIFY는 꼭 필요한 경우에만, 한 번에 한 가지 핵심 질문만 한다.
 
 [PLAN 규칙]
 - 실제로 필요한 작업만, 수행할 순서대로 화살표(->)로 나열하세요.
@@ -287,41 +296,65 @@ INTENT_PROMPT = """당신은 멀티 에이전트 파이프라인의 첫 번째 �
 [사용자 요청]
 {question}
 
-이제 아래 형식으로만, 다른 설명 없이 정확히 두 줄로 답하세요.
+이제 아래 형식 중 하나로만, 다른 설명 없이 답하세요.
+• 의도가 명확하면 (정확히 두 줄):
 PLAN: <작업 순서 또는 none>
-REQUEST: <다시 쓴 요청>"""
+REQUEST: <다시 쓴 요청>
+• 의도가 모호해 계획을 세울 수 없으면 (정확히 한 줄):
+CLARIFY: <사용자에게 물어볼 한 가지 핵심 질문>"""
+
+
+_INTENT_SYSTEM = SystemMessage(
+  "당신은 사용자 요청의 의도를 분석하는 플래너입니다. "
+  "요청을 완수하는 데 필요한 작업(rag/tools) 순서를 계획으로 세우고, "
+  "대화 맥락을 반영해 요청을 명확한 지시문으로 다시 쓰는 것이 임무입니다. "
+  "요청이 너무 모호해 계획을 세울 수 없으면 CLARIFY로 질문하세요. "
+  "직접 답을 작성하지 말고, 지정된 형식(PLAN/REQUEST 또는 CLARIFY)으로만 출력하세요."
+)
 
 
 def intent_classification_node(state: State) -> State:
   """최초 요청의 의도를 분석해 (1) 작업 순서(계획)를 세우고,
   (2) 대화 맥락을 반영해 요청을 명확히 다시 써서 다음 노드들이 이해하도록 만듭니다.
+  의도가 모호하면 interrupt()로 사용자에게 명확화 질문을 하고, 답변을 받아 재분석합니다.
   그 뒤 계획의 첫 단계로 라우팅합니다."""
   question = state["messages"][-1].content
   history = list(state["messages"][:-1])   # 현재 요청을 제외한 이전 대화 기록
-  prompt = INTENT_PROMPT.format(question=question, tools_desc=TOOLS_DESC)
-  # 대화 기록을 앞에 붙여 후속 질문("그거", "방금 그 값" 등)의 맥락을 파악합니다
-  result = llm.invoke([SystemMessage(
-    "당신은 사용자 요청의 의도를 분석하는 플래너입니다. "
-    "요청을 완수하는 데 필요한 작업(rag/tools) 순서를 계획으로 세우고, "
-    "대화 맥락을 반영해 요청을 명확한 지시문으로 다시 쓰는 것이 임무입니다. "
-    "직접 답을 작성하지 말고, 지정된 형식(PLAN/REQUEST)으로만 출력하세요."
-  )] + history + [{"role": "user", "content": prompt}])
 
-  plan, requests = _parse_intent(result.content)
+  def _analyze(q: str) -> tuple[list[str], list[str], str | None]:
+    prompt = INTENT_PROMPT.format(question=q, tools_desc=TOOLS_DESC)
+    result = llm.invoke([_INTENT_SYSTEM] + history + [{"role": "user", "content": prompt}])
+    return _parse_intent(result.content)
+
+  plan, requests, clarifying_question = _analyze(question)
+
+  # 의도가 모호하면 사용자에게 질문하고 재분석
+  extra_messages = []
+  if clarifying_question:
+    print(f"\n  [intent] 의도 불명확 → 명확화 질문", flush=True)
+    clarification = interrupt(clarifying_question)
+    # 명확화 문답을 messages에 추가 → final_answer_node가 clarification을 마지막 질문으로 인식
+    extra_messages = [
+      AIMessage(content=clarifying_question),
+      HumanMessage(content=clarification),
+    ]
+    updated_question = f"{question}\n\n[사용자 보충 설명]\n{clarification}"
+    plan, requests, _ = _analyze(updated_question)
+
   # 단계별 지시문을 못 뽑은 경우 원본 질문 하나로 폴백
   resolved_queries = requests or [question]
   intent = " -> ".join(plan) if plan else "none (대화 기록만으로 답변)"
   first_action = plan[0] if plan else "final"
-  # 첫 단계(plan[0])는 여기서 바로 라우팅하므로 대응하는 지시문을 활성화
   first_query = resolved_queries[0]
 
   print(f"\n  [intent] 의도 분류: {intent}", flush=True)
-  print(f"  [intent] 의도 분류 단계별 요청 문구: {' -> '.join(resolved_queries)}", flush=True)
+  print(f"  [intent] 단계별 요청 문구: {' -> '.join(resolved_queries)}", flush=True)
   return {
+    "messages": extra_messages,   # clarification 문답을 대화 이력에 반영
     "resolved_query": first_query,
     "resolved_queries": resolved_queries,
     "plan": plan,
-    "plan_cursor": 1,          # 0번은 지금 라우팅하므로 다음 실행 위치는 1
+    "plan_cursor": 1,
     "next_action": first_action,
     "steps": 1,
   }
@@ -558,6 +591,24 @@ graph = (
 
 # ── 실행 ───────────────────────────────────────────
 
+def _run_stream(graph_input, config) -> tuple[object | None, list[str]]:
+  """graph_input으로 스트림을 실행하고 (ai_chunk, sources)를 반환합니다."""
+  ai_chunk = None
+  sources_captured: list[str] = []
+  for mode, chunk in graph.stream(graph_input, config=config, stream_mode=["messages", "updates"]):
+    if mode == "updates":
+      if "rerank_node" in chunk:
+        for src in chunk["rerank_node"].get("sources", []):
+          if src not in sources_captured:
+            sources_captured.append(src)
+    elif mode == "messages":
+      token, metadata = chunk
+      if metadata.get("langgraph_node") in {"final_answer_node"} and token.content:
+        print(token.content, end="", flush=True)
+        ai_chunk = token if ai_chunk is None else ai_chunk + token
+  return ai_chunk, sources_captured
+
+
 def chat(thread_id: str = "user-1"):
   print("Supervisor 챗봇 시작 (종료: quit)\n")
 
@@ -570,47 +621,38 @@ def chat(thread_id: str = "user-1"):
     if not user_input:
       continue
 
-    # stream_mode 리스트: (mode, chunk) 튜플로 yield됨
-    print("AI", end="", flush=True)
-    ai_chunk = None
-    sources_captured: list[str] = []
+    graph_input = {
+      "messages": [{"role": "user", "content": user_input}],
+      "candidates": [], "context": [], "sources": [], "findings": [],
+      "resolved_query": "", "resolved_queries": [], "plan": [],
+      "plan_cursor": 0, "next_action": "", "steps": 0,
+    }
 
-    for mode, chunk in graph.stream(
-        {
-          "messages": [{"role": "user", "content": user_input}],
-          "candidates": [],
-          "context": [],
-          "sources": [],
-          "findings": [],
-          "resolved_query": "",
-          "resolved_queries": [],
-          "plan": [],
-          "plan_cursor": 0,
-          "next_action": "",
-          "steps": 0,
-        },
-        config=config,
-        stream_mode=["messages", "updates"],
-    ):
-      if mode == "updates":
-        # rerank가 여러 번 돌 수 있으므로 출처는 누적합니다
-        if "rerank_node" in chunk:
-          for src in chunk["rerank_node"].get("sources", []):
-            if src not in sources_captured:
-              sources_captured.append(src)
-      elif mode == "messages":
-        token, metadata = chunk
-        # {"final_answer_node"} -> 최종 답변을 스트리밍으로 출력할 노드
-        if metadata.get("langgraph_node") in {"final_answer_node"} and token.content:
-          print(token.content, end="", flush=True)
-          ai_chunk = token if ai_chunk is None else ai_chunk + token
+    current_input = graph_input
+    while True:
+      print("AI", end="", flush=True)
+      ai_chunk, sources_captured = _run_stream(current_input, config)
 
-    # 스트리밍된 답변이 _UNANSWERABLE_PREFIX로 시작하면 출처 표시 생략
-    answer_text = ai_chunk.content.strip() if ai_chunk else ""
-    if sources_captured and not answer_text.startswith(_UNANSWERABLE_PREFIX):
-      print(f"\n출처: {' · '.join(sources_captured)}", end="", flush=True)
+      # interrupt 여부 확인
+      state = graph.get_state(config)
+      interrupted_tasks = [t for t in state.tasks if t.interrupts]
 
-    print("\n")
+      if interrupted_tasks:
+        # interrupt(clarifying_question)의 값을 꺼내 사용자에게 질문
+        clarifying_q = interrupted_tasks[0].interrupts[0].value
+        print(f": {clarifying_q}\n")
+        clarification = input("You: ").encode("utf-8", errors="replace").decode("utf-8").strip()
+        if not clarification:
+          break
+        current_input = Command(resume=clarification)
+        continue
+
+      # 최종 답변 출력 완료
+      answer_text = ai_chunk.content.strip() if ai_chunk else ""
+      if sources_captured and not answer_text.startswith(_UNANSWERABLE_PREFIX):
+        print(f"\n출처: {' · '.join(sources_captured)}", end="", flush=True)
+      print("\n")
+      break
 
 
 if __name__ == "__main__":

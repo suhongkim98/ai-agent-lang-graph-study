@@ -318,10 +318,12 @@ uv run python chatbot.py
 ### 종합 챗봇 v2 (Supervisor) — `supervisor_chatbot.py`
 
 `intent_classification`이 작업 순서(계획)를 수립하고, `supervisor`가 한 단계씩 워커를 오케스트레이션하는 멀티 에이전트 챗봇입니다.
+의도가 모호하면 `interrupt()`로 사용자에게 명확화 질문을 한 뒤 재분석합니다.
 
 ```
-START → intent_classification ─┐
-                               ↓ (계획의 첫 단계로 라우팅)
+START → intent_classification ─┬─ [의도 명확] ──────────────────────────────────────┐
+                               │                                                    ↓ (계획의 첫 단계로 라우팅)
+                               └─ [의도 모호] → INTERRUPT → 사용자 답변 → 재분석 ──┘
             supervisor ─┬→ retrieve → rerank → rag_chat ─┐
                         ├→ tool_agent ────────────────────┤ (결과는 supervisor로 반환)
                         └→ final_answer → END
@@ -331,11 +333,22 @@ START → intent_classification ─┐
 
 | 노드 | 역할 |
 |------|------|
-| `intent_classification_node` | 사용자 요청 + 대화 기록 분석 → `PLAN`(작업 순서) + `REQUEST`(단계별 지시문) 출력 |
+| `intent_classification_node` | 요청 분석 → `PLAN`+`REQUEST` 출력. 모호하면 `CLARIFY` 출력 → `interrupt()`로 사용자에게 질문 후 재분석 |
 | `supervisor_node` | 계획을 한 단계씩 실행 — 워커에게 위임하고, 완료 후 `final_answer`로 전달 (`MAX_SUPERVISOR_STEPS=10`) |
 | `rag_chat_node` | 검색된 문서 근거로 정보 정리 → `findings`에 누적 |
 | `tool_agent_node` | ReAct 도구 실행 → 결과를 `findings`에 누적 |
 | `final_answer_node` | 누적된 `findings` + 대화 기록 종합 → 최종 답변 생성 |
+
+**의도 명확화 (Human-in-the-Loop)**
+
+LLM이 `CLARIFY: <질문>` 형식으로 응답하면 `interrupt()`가 발동됩니다.
+
+```
+You: 그거 알아봐줘
+AI: 어떤 항목에 대해 알아봐 드릴까요?   ← interrupt로 중단 후 질문
+You: LangChain이요
+AI: LangChain은 ...                      ← 보충 설명 포함해 재분석 후 답변
+```
 
 **`chatbot.py`와의 차이**
 
@@ -344,6 +357,7 @@ START → intent_classification ─┐
 | 라우팅 | `router_node` 단순 1회 분기 | `intent_classification` → 다단계 계획 |
 | 작업 처리 | tools 또는 RAG 중 하나 | `tools → rag → tools` 등 복합 순서 가능 |
 | 결과 축적 | 없음 (워커가 직접 최종 답변) | `findings` 누적 후 `final_answer_node`가 종합 |
+| 의도 명확화 | 없음 | 모호한 요청 시 `interrupt()`로 사용자에게 질문 |
 | 메모리 | `MemorySaver` + `thread_id` | `MemorySaver` + `thread_id` |
 | 디버그 출력 | 도구 호출명·결과 | 의도 분류 결과, supervisor 단계 진행 상황 추가 출력 |
 
@@ -356,7 +370,7 @@ START → intent_classification ─┐
 uv run python supervisor_chatbot.py
 ```
 
-대화 루프가 실행됩니다. `quit` 입력 시 종료. 의도 분류와 supervisor 진행 상황이 터미널에 출력됩니다.
+대화 루프가 실행됩니다. `quit` 입력 시 종료. 의도가 모호하면 추가 질문을 하고, 분류·진행 상황이 터미널에 출력됩니다.
 
 ---
 
